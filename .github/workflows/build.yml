@@ -1,0 +1,1493 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the app project
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'COVER_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.coverwallpaper"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.example.coverwallpaper"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'COVER_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Needed to download cover art when the music app only gives us an image link. -->
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <!-- Lets the home screen see the list of launchable apps. -->
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".LauncherActivity"
+                      android:exported="true"
+                      android:label="@string/launcher_name"
+                      android:launchMode="singleTask"
+                      android:stateNotNeeded="true"
+                      android:theme="@style/LauncherTheme">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".SettingsActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CoverWallpaperService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_WALLPAPER">
+                      <intent-filter>
+                          <action android:name="android.service.wallpaper.WallpaperService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.service.wallpaper"
+                          android:resource="@xml/wallpaper" />
+                  </service>
+
+                  <!-- Gives the app permission to read "now playing" info of other apps. -->
+                  <service
+                      android:name=".NowPlayingListenerService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/coverwallpaper/AlbumFetcher.kt')"
+          cat > 'app/src/main/java/com/example/coverwallpaper/AlbumFetcher.kt' <<'COVER_EOF'
+          package com.example.coverwallpaper
+
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.os.Handler
+          import android.os.Looper
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import java.util.concurrent.Callable
+          import java.util.concurrent.ConcurrentHashMap
+          import java.util.concurrent.Executors
+
+          /**
+           * Finds an artist's albums and EPs (singles are skipped) through Apple's public iTunes Search
+           * API, which needs no account or key, and downloads their covers.
+           */
+          object AlbumFetcher {
+
+              private const val MAX_COVERS = 40
+              private const val MAX_BYTES = 4 * 1024 * 1024
+              private const val AGENT = "CoverWallpaper/1.0"
+
+              private val main = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+              private val pool = Executors.newFixedThreadPool(4)
+              private val cache = ConcurrentHashMap<String, List<Bitmap>>()
+
+              /** Calls [done] on the main thread. The list is empty if nothing was found or offline. */
+              fun load(artist: String, done: (List<Bitmap>) -> Unit) {
+                  val key = artist.lowercase()
+                  cache[key]?.let { done(it); return }
+
+                  io.execute {
+                      val covers = runCatching { find(artist) }.getOrDefault(emptyList())
+                      if (covers.isNotEmpty()) cache[key] = covers // do not cache failures, so we retry later
+                      main.post { done(covers) }
+                  }
+              }
+
+              // ---------------------------------------------------------------- io thread
+
+              private fun find(artist: String): List<Bitmap> {
+                  // "Artist A, Artist B" or "A feat. B": try the full name first, then just the first name.
+                  val first = artist.split(Regex(",|&|\\bfeat\\.?\\b|\\bft\\.?\\b|\\bx\\b", RegexOption.IGNORE_CASE))
+                      .first().trim()
+                  for (name in listOf(artist, first).filter { it.isNotEmpty() }.distinct()) {
+                      val covers = findExact(name)
+                      if (covers.isNotEmpty()) return covers
+                  }
+                  return emptyList()
+              }
+
+              private fun findExact(name: String): List<Bitmap> {
+                  val q = URLEncoder.encode(name, "UTF-8")
+                  val search = JSONObject(
+                      getText("https://itunes.apple.com/search?term=$q&entity=musicArtist&limit=5"),
+                  ).optJSONArray("results") ?: return emptyList()
+
+                  var artistId = -1L
+                  for (i in 0 until search.length()) {
+                      val item = search.getJSONObject(i)
+                      if (item.optString("artistName").equals(name, ignoreCase = true)) {
+                          artistId = item.optLong("artistId", -1L)
+                          break
+                      }
+                  }
+                  if (artistId < 0 && search.length() > 0) artistId = search.getJSONObject(0).optLong("artistId", -1L)
+                  if (artistId < 0) return emptyList()
+
+                  val albums = JSONObject(
+                      getText("https://itunes.apple.com/lookup?id=$artistId&entity=album&limit=200"),
+                  ).optJSONArray("results") ?: return emptyList()
+
+                  val seen = HashSet<Long>()
+                  val urls = ArrayList<String>()
+                  for (i in 0 until albums.length()) {
+                      val item = albums.getJSONObject(i)
+                      if (item.optString("wrapperType") != "collection") continue
+                      if (item.optString("collectionName").endsWith(" - Single")) continue // albums and EPs only
+                      if (!seen.add(item.optLong("collectionId"))) continue
+                      val art = item.optString("artworkUrl100")
+                      if (art.isEmpty()) continue
+                      urls.add(art.replace("100x100bb", "300x300bb"))
+                      if (urls.size >= MAX_COVERS) break
+                  }
+
+                  val jobs = urls.map { url -> Callable { runCatching { getBitmap(url) }.getOrNull() } }
+                  return pool.invokeAll(jobs).mapNotNull { runCatching { it.get() }.getOrNull() }
+              }
+
+              private fun open(url: String): HttpURLConnection =
+                  (URL(url).openConnection() as HttpURLConnection).apply {
+                      connectTimeout = 8000
+                      readTimeout = 8000
+                      setRequestProperty("User-Agent", AGENT)
+                  }
+
+              private fun getText(url: String): String {
+                  val c = open(url)
+                  try {
+                      check(c.responseCode == 200) { "HTTP ${c.responseCode}" }
+                      return c.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
+                  } finally {
+                      c.disconnect()
+                  }
+              }
+
+              private fun getBitmap(url: String): Bitmap? {
+                  val c = open(url)
+                  try {
+                      if (c.responseCode != 200) return null
+                      val bytes = c.inputStream.use { it.readBytes() }
+                      if (bytes.size > MAX_BYTES) return null
+                      return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                  } finally {
+                      c.disconnect()
+                  }
+              }
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/coverwallpaper/CoverRenderer.kt')"
+          cat > 'app/src/main/java/com/example/coverwallpaper/CoverRenderer.kt' <<'COVER_EOF'
+          package com.example.coverwallpaper
+
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import kotlin.math.abs
+          import kotlin.math.ceil
+          import kotlin.math.max
+          import kotlin.math.pow
+
+          /** One cover plus a cached blurred version of it. */
+          class Scene(val src: Bitmap) {
+              private var blurred: Bitmap? = null
+              private var blurredFor = -1
+
+              fun blurred(pct: Int): Bitmap {
+                  if (pct <= 0) return src
+                  if (pct == blurredFor) blurred?.let { return it }
+
+                  // Shrink a lot, soften, and let bilinear scaling stretch it back: a cheap, smooth blur.
+                  val target = max(4, (src.width * 0.5.pow(pct / 12.0)).toInt())
+                  val small = Bitmap.createScaledBitmap(src, target, target, true)
+                  val soft = small.copy(Bitmap.Config.ARGB_8888, true)
+                  boxBlur(soft, 2)
+                  boxBlur(soft, 2)
+
+                  blurred = soft
+                  blurredFor = pct
+                  return soft
+              }
+
+              private fun boxBlur(bmp: Bitmap, radius: Int) {
+                  val w = bmp.width
+                  val h = bmp.height
+                  val px = IntArray(w * h)
+                  bmp.getPixels(px, 0, w, 0, 0, w, h)
+                  val tmp = IntArray(w * h)
+                  blurPass(px, tmp, w, h, radius, horizontal = true)
+                  blurPass(tmp, px, w, h, radius, horizontal = false)
+                  bmp.setPixels(px, 0, w, 0, 0, w, h)
+              }
+
+              private fun blurPass(src: IntArray, dst: IntArray, w: Int, h: Int, r: Int, horizontal: Boolean) {
+                  val lines = if (horizontal) h else w
+                  val length = if (horizontal) w else h
+                  for (line in 0 until lines) {
+                      for (i in 0 until length) {
+                          var a = 0; var rr = 0; var g = 0; var b = 0; var n = 0
+                          for (k in -r..r) {
+                              val j = i + k
+                              if (j < 0 || j >= length) continue
+                              val c = if (horizontal) src[line * w + j] else src[j * w + line]
+                              a += c ushr 24; rr += (c shr 16) and 0xFF; g += (c shr 8) and 0xFF; b += c and 0xFF
+                              n++
+                          }
+                          val out = ((a / n) shl 24) or ((rr / n) shl 16) or ((g / n) shl 8) or (b / n)
+                          if (horizontal) dst[line * w + i] = out else dst[i * w + line] = out
+                      }
+                  }
+              }
+          }
+
+          /**
+           * Lays out the cover as a grid of square tiles. The tile in the middle is the cover itself;
+           * every tile above and below (and beside it, if the cover is narrower than the screen) is a
+           * flipped copy, so neighbouring tiles always meet along identical edges.
+           */
+          class CoverRenderer {
+
+              private val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+              private val dst = RectF()
+
+              /** Draws one cover scene. alpha 0-255 is used for the cross-fade. */
+              fun drawScene(canvas: Canvas, w: Int, h: Int, look: Look, scene: Scene, alpha: Int) {
+                  val layered = alpha < 255
+                  if (layered) canvas.saveLayerAlpha(0f, 0f, w.toFloat(), h.toFloat(), alpha)
+
+                  val side = w * look.sizePct.coerceIn(10, 100) / 100f
+                  val left = (w - side) / 2f
+                  val top = (h - side) / 2f + h * look.offsetPct / 100f
+
+                  val outer = scene.blurred(look.blurPct)
+
+                  val rowsUp = ceil(top / side).toInt().coerceAtLeast(0)
+                  val rowsDown = ceil((h - (top + side)) / side).toInt().coerceAtLeast(0)
+                  val colsLeft = ceil(left / side).toInt().coerceAtLeast(0)
+                  val colsRight = ceil((w - (left + side)) / side).toInt().coerceAtLeast(0)
+
+                  for (row in -rowsUp..rowsDown) {
+                      for (col in -colsLeft..colsRight) {
+                          if (row == 0 && col == 0) continue // middle tile is drawn last, sharp
+                          drawTile(
+                              canvas, outer,
+                              left + col * side, top + row * side, side,
+                              flipX = look.mirror && abs(col) % 2 == 1,
+                              flipY = look.mirror && abs(row) % 2 == 1,
+                          )
+                      }
+                  }
+
+                  if (look.centerShown) drawTile(canvas, scene.src, left, top, side, flipX = false, flipY = false)
+
+                  if (layered) canvas.restore()
+              }
+
+              fun drawDim(canvas: Canvas, look: Look) {
+                  if (look.dimPct > 0) canvas.drawColor(Color.argb(look.dimPct.coerceIn(0, 100) * 255 / 100, 0, 0, 0))
+              }
+
+              private fun drawTile(
+                  canvas: Canvas, bmp: Bitmap,
+                  x: Float, y: Float, side: Float,
+                  flipX: Boolean, flipY: Boolean,
+              ) {
+                  canvas.save()
+                  canvas.translate(x + if (flipX) side else 0f, y + if (flipY) side else 0f)
+                  canvas.scale(if (flipX) -1f else 1f, if (flipY) -1f else 1f)
+                  // Overdraw by half a pixel so no hairline gaps show between tiles.
+                  dst.set(-0.5f, -0.5f, side + 0.5f, side + 0.5f)
+                  canvas.drawBitmap(bmp, null, dst, paint)
+                  canvas.restore()
+              }
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/coverwallpaper/CoverWallpaperService.kt')"
+          cat > 'app/src/main/java/com/example/coverwallpaper/CoverWallpaperService.kt' <<'COVER_EOF'
+          package com.example.coverwallpaper
+
+          import android.content.SharedPreferences
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.service.wallpaper.WallpaperService
+          import android.view.SurfaceHolder
+
+          class CoverWallpaperService : WallpaperService() {
+
+              override fun onCreateEngine(): Engine = CoverEngine()
+
+              private inner class CoverEngine :
+                  Engine(),
+                  NowPlayingTracker.Listener,
+                  SharedPreferences.OnSharedPreferenceChangeListener {
+
+                  private val ctx = this@CoverWallpaperService
+                  private val handler = Handler(Looper.getMainLooper())
+                  private val renderer = CoverRenderer()
+                  private val frame = Runnable { drawFrame() }
+
+                  private var look: Look = Prefs.load(ctx)
+                  private var cur: Scene? = null
+                  private var prev: Scene? = null
+                  private var fadeStart = 0L
+                  private var visible = false
+                  private var width = 0
+                  private var height = 0
+
+                  override fun onCreate(surfaceHolder: SurfaceHolder) {
+                      super.onCreate(surfaceHolder)
+                      Prefs.sp(ctx).registerOnSharedPreferenceChangeListener(this)
+                      NowPlayingTracker.start(ctx)
+                      NowPlayingTracker.addListener(this)
+                  }
+
+                  override fun onDestroy() {
+                      NowPlayingTracker.removeListener(this)
+                      Prefs.sp(ctx).unregisterOnSharedPreferenceChangeListener(this)
+                      handler.removeCallbacks(frame)
+                      super.onDestroy()
+                  }
+
+                  override fun onVisibilityChanged(visible: Boolean) {
+                      this.visible = visible
+                      if (visible) {
+                          look = Prefs.load(ctx)
+                          NowPlayingTracker.start(ctx) // retries if access was granted since last time
+                          drawFrame()
+                      } else {
+                          handler.removeCallbacks(frame)
+                      }
+                  }
+
+                  override fun onSurfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                      super.onSurfaceChanged(holder, format, width, height)
+                      this.width = width
+                      this.height = height
+                      drawFrame()
+                  }
+
+                  override fun onSurfaceDestroyed(holder: SurfaceHolder) {
+                      visible = false
+                      handler.removeCallbacks(frame)
+                      super.onSurfaceDestroyed(holder)
+                  }
+
+                  // ------------------------------------------------------------ events
+
+                  override fun onCover(bitmap: Bitmap?) {
+                      if (cur?.src === bitmap) return
+                      val old = cur
+                      if (bitmap == null) {
+                          prev = null
+                          cur = null
+                          fadeStart = 0L
+                      } else {
+                          prev = old
+                          cur = Scene(bitmap)
+                          fadeStart = if (old != null && look.fadeMs > 0) SystemClock.uptimeMillis() else 0L
+                      }
+                      drawFrame()
+                  }
+
+                  override fun onSharedPreferenceChanged(sp: SharedPreferences, key: String?) {
+                      look = Prefs.load(ctx)
+                      if (key == Prefs.ONLY_BLAZIFY || key == Prefs.KEEP_LAST) NowPlayingTracker.refresh()
+                      drawFrame()
+                  }
+
+                  // ------------------------------------------------------------ drawing
+
+                  private fun drawFrame() {
+                      handler.removeCallbacks(frame)
+                      if (!visible || width == 0 || height == 0) return
+
+                      val holder = surfaceHolder
+                      var canvas: Canvas? = null
+                      var animating = false
+                      try {
+                          canvas = holder.lockCanvas() ?: return
+                          canvas.drawColor(Color.BLACK)
+
+                          val old = prev
+                          val t = if (fadeStart == 0L || old == null) 1f
+                          else ((SystemClock.uptimeMillis() - fadeStart) / look.fadeMs.coerceAtLeast(1).toFloat())
+                              .coerceIn(0f, 1f)
+
+                          if (t < 1f && old != null) renderer.drawScene(canvas, width, height, look, old, 255)
+                          cur?.let {
+                              val alpha = if (t < 1f && old != null) (t * 255).toInt() else 255
+                              renderer.drawScene(canvas, width, height, look, it, alpha)
+                          }
+                          renderer.drawDim(canvas, look)
+
+                          if (t >= 1f) {
+                              prev = null
+                              fadeStart = 0L
+                          } else {
+                              animating = true
+                          }
+                      } finally {
+                          canvas?.let {
+                              try {
+                                  holder.unlockCanvasAndPost(it)
+                              } catch (e: IllegalArgumentException) {
+                                  // surface went away while drawing
+                              }
+                          }
+                      }
+                      if (animating) handler.postDelayed(frame, 16)
+                  }
+              }
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/coverwallpaper/LauncherActivity.kt')"
+          cat > 'app/src/main/java/com/example/coverwallpaper/LauncherActivity.kt' <<'COVER_EOF'
+          package com.example.coverwallpaper
+
+          import android.app.Activity
+          import android.content.BroadcastReceiver
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapShader
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Matrix
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.graphics.drawable.BitmapDrawable
+          import android.graphics.drawable.Drawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.GridView
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.Random
+
+          /**
+           * A minimal home screen. Android does not let one app change another app's icon, so this
+           * launcher draws the icons itself: while a song plays, each app shows one of the artist's
+           * album or EP covers. With fewer covers than apps, the covers repeat in order.
+           */
+          class LauncherActivity : Activity(), NowPlayingTracker.ArtistListener,
+              SharedPreferences.OnSharedPreferenceChangeListener {
+
+              private class AppEntry(val label: String, val component: ComponentName, val original: Drawable)
+
+              private lateinit var grid: GridView
+              private lateinit var adapter: AppAdapter
+
+              private var apps: List<AppEntry> = emptyList()
+              private var look = Look()
+              private var covers: List<Bitmap> = emptyList()
+              private var coverArtist: String? = null
+              private var iconDrawables: List<Drawable?> = emptyList()
+              private var fetchToken = 0
+
+              private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+
+              private val packageReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context, intent: Intent) {
+                      loadApps()
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  look = Prefs.load(this)
+
+                  grid = GridView(this).apply {
+                      numColumns = look.columns.coerceIn(3, 6)
+                      verticalSpacing = dp(14)
+                      stretchMode = GridView.STRETCH_COLUMN_WIDTH
+                      selector = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
+                      clipToPadding = false
+                      setPadding(dp(8), dp(16), dp(8), dp(16))
+                      setOnApplyWindowInsetsListener { v, insets ->
+                          v.setPadding(
+                              dp(8) + insets.systemWindowInsetLeft,
+                              dp(16) + insets.systemWindowInsetTop,
+                              dp(8) + insets.systemWindowInsetRight,
+                              dp(16) + insets.systemWindowInsetBottom,
+                          )
+                          insets
+                      }
+                  }
+                  adapter = AppAdapter()
+                  grid.adapter = adapter
+                  grid.setOnItemClickListener { _, _, position, _ -> launch(apps[position]) }
+                  grid.setOnItemLongClickListener { _, _, position, _ ->
+                      openAppInfo(apps[position])
+                      true
+                  }
+                  setContentView(grid)
+                  loadApps()
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  Prefs.sp(this).registerOnSharedPreferenceChangeListener(this)
+                  val filter = IntentFilter().apply {
+                      addAction(Intent.ACTION_PACKAGE_ADDED)
+                      addAction(Intent.ACTION_PACKAGE_REMOVED)
+                      addAction(Intent.ACTION_PACKAGE_CHANGED)
+                      addDataScheme("package")
+                  }
+                  registerReceiver(packageReceiver, filter)
+                  look = Prefs.load(this)
+                  applyLook()
+                  NowPlayingTracker.start(this)
+                  NowPlayingTracker.addArtistListener(this)
+              }
+
+              override fun onStop() {
+                  NowPlayingTracker.removeArtistListener(this)
+                  runCatching { unregisterReceiver(packageReceiver) }
+                  Prefs.sp(this).unregisterOnSharedPreferenceChangeListener(this)
+                  super.onStop()
+              }
+
+              @Deprecated("A home screen has nowhere to go back to.")
+              override fun onBackPressed() {
+                  // stay on the home screen
+              }
+
+              override fun onNewIntent(intent: Intent?) {
+                  super.onNewIntent(intent)
+                  grid.smoothScrollToPosition(0) // pressing Home again scrolls back to the top
+              }
+
+              // ------------------------------------------------------------ events
+
+              override fun onArtist(artist: String?) {
+                  if (artist == null) {
+                      fetchToken++
+                      coverArtist = null
+                      covers = emptyList()
+                      rebuildIcons()
+                      return
+                  }
+                  if (artist == coverArtist) return
+                  coverArtist = artist
+                  val token = ++fetchToken
+                  AlbumFetcher.load(artist) { list ->
+                      if (token != fetchToken) return@load // another artist started playing meanwhile
+                      covers = list
+                      if (list.isEmpty()) coverArtist = null // allow a retry on the next callback
+                      rebuildIcons()
+                  }
+              }
+
+              override fun onSharedPreferenceChanged(sp: SharedPreferences, key: String?) {
+                  look = Prefs.load(this)
+                  applyLook()
+              }
+
+              private fun applyLook() {
+                  grid.numColumns = look.columns.coerceIn(3, 6)
+                  rebuildIcons()
+              }
+
+              // ------------------------------------------------------------ apps
+
+              private fun loadApps() {
+                  val pm = packageManager
+                  val query = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  apps = pm.queryIntentActivities(query, 0)
+                      .map {
+                          AppEntry(
+                              label = it.loadLabel(pm).toString(),
+                              component = ComponentName(it.activityInfo.packageName, it.activityInfo.name),
+                              original = it.loadIcon(pm),
+                          )
+                      }
+                      .sortedBy { it.label.lowercase() }
+                  rebuildIcons()
+              }
+
+              private fun launch(app: AppEntry) {
+                  val intent = Intent(Intent.ACTION_MAIN)
+                      .addCategory(Intent.CATEGORY_LAUNCHER)
+                      .setComponent(app.component)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                  try {
+                      startActivity(intent)
+                  } catch (e: Exception) {
+                      // app was removed or cannot be opened
+                  }
+              }
+
+              private fun openAppInfo(app: AppEntry) {
+                  try {
+                      startActivity(
+                          Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                              .setData(Uri.fromParts("package", app.component.packageName, null)),
+                      )
+                  } catch (e: Exception) {
+                      // nothing to show
+                  }
+              }
+
+              // ------------------------------------------------------------ icons
+
+              /** App number i gets cover number i, wrapping around when there are fewer covers than apps. */
+              private fun rebuildIcons() {
+                  val list = covers
+                  if (!look.iconCovers || list.isEmpty()) {
+                      iconDrawables = List(apps.size) { null }
+                  } else {
+                      // Same order for the same artist every time, but different artists look different.
+                      val order = list.indices.shuffled(Random((coverArtist ?: "").hashCode().toLong()))
+                      val size = dp(56)
+                      val cache = HashMap<Int, Drawable>()
+                      iconDrawables = apps.indices.map { i ->
+                          val index = order[i % order.size]
+                          cache.getOrPut(index) { roundedIcon(list[index], size, look.corner) }
+                      }
+                  }
+                  adapter.notifyDataSetChanged()
+              }
+
+              private fun roundedIcon(src: Bitmap, size: Int, cornerPct: Int): Drawable {
+                  val out = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+                  val shader = BitmapShader(src, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply {
+                      setLocalMatrix(Matrix().apply {
+                          setScale(size / src.width.toFloat(), size / src.height.toFloat())
+                      })
+                  }
+                  val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply { this.shader = shader }
+                  val radius = size * cornerPct.coerceIn(0, 50) / 100f
+                  Canvas(out).drawRoundRect(RectF(0f, 0f, size.toFloat(), size.toFloat()), radius, radius, paint)
+                  return BitmapDrawable(resources, out)
+              }
+
+              // ------------------------------------------------------------ grid
+
+              private inner class AppAdapter : BaseAdapter() {
+                  override fun getCount() = apps.size
+                  override fun getItem(position: Int) = apps[position]
+                  override fun getItemId(position: Int) = position.toLong()
+
+                  override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                      val cell: LinearLayout
+                      val icon: ImageView
+                      val label: TextView
+                      if (convertView == null) {
+                          cell = LinearLayout(this@LauncherActivity).apply {
+                              orientation = LinearLayout.VERTICAL
+                              gravity = Gravity.CENTER_HORIZONTAL
+                          }
+                          icon = ImageView(this@LauncherActivity).apply {
+                              layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
+                              scaleType = ImageView.ScaleType.FIT_CENTER
+                          }
+                          label = TextView(this@LauncherActivity).apply {
+                              textSize = 12f
+                              setTextColor(Color.WHITE)
+                              setShadowLayer(4f, 0f, 1f, Color.BLACK)
+                              maxLines = 1
+                              ellipsize = android.text.TextUtils.TruncateAt.END
+                              gravity = Gravity.CENTER
+                              setPadding(0, dp(4), 0, 0)
+                          }
+                          cell.addView(icon)
+                          cell.addView(label)
+                      } else {
+                          cell = convertView as LinearLayout
+                          icon = cell.getChildAt(0) as ImageView
+                          label = cell.getChildAt(1) as TextView
+                      }
+                      val app = apps[position]
+                      icon.setImageDrawable(iconDrawables.getOrNull(position) ?: app.original)
+                      label.text = app.label
+                      return cell
+                  }
+              }
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/coverwallpaper/NowPlayingListenerService.kt')"
+          cat > 'app/src/main/java/com/example/coverwallpaper/NowPlayingListenerService.kt' <<'COVER_EOF'
+          package com.example.coverwallpaper
+
+          import android.service.notification.NotificationListenerService
+
+          /**
+           * Never looks at your notifications. It exists only because Android requires an enabled
+           * notification listener before an app may read other apps' media sessions (now playing info).
+           */
+          class NowPlayingListenerService : NotificationListenerService() {
+
+              override fun onListenerConnected() {
+                  super.onListenerConnected()
+                  NowPlayingTracker.start(this)
+              }
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/coverwallpaper/NowPlayingTracker.kt')"
+          cat > 'app/src/main/java/com/example/coverwallpaper/NowPlayingTracker.kt' <<'COVER_EOF'
+          package com.example.coverwallpaper
+
+          import android.content.ComponentName
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.media.MediaMetadata
+          import android.media.session.MediaController
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import java.io.ByteArrayOutputStream
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.InputStream
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.concurrent.CopyOnWriteArraySet
+          import java.util.concurrent.Executors
+          import kotlin.math.min
+
+          /**
+           * Watches the media sessions of other apps (Blazify publishes one like every Android player)
+           * and turns the current song's artwork into a square bitmap.
+           *
+           * All state is touched on the main thread only. Network and disk work runs on [io].
+           */
+          object NowPlayingTracker {
+
+              fun interface Listener {
+                  /** Called on the main thread. null = no cover to show. */
+                  fun onCover(bitmap: Bitmap?)
+              }
+
+              private const val BLAZIFY_PREFIX = "com.blazify"
+              private const val MAX_SIDE = 1024
+              private const val MAX_DOWNLOAD_BYTES = 12 * 1024 * 1024
+              private const val SAVED_FILE = "last_cover.jpg"
+
+              fun interface ArtistListener {
+                  /** Called on the main thread. null = no artist known. */
+                  fun onArtist(artist: String?)
+              }
+
+              private const val LAST_ARTIST_KEY = "last_artist"
+
+              private val listeners = CopyOnWriteArraySet<Listener>()
+              private val artistListeners = CopyOnWriteArraySet<ArtistListener>()
+
+              var artist: String? = null
+                  private set
+              private val main = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+
+              var cover: Bitmap? = null
+                  private set
+
+              private var appContext: Context? = null
+              private var started = false
+              private var controllers: List<MediaController> = emptyList()
+              private var currentKey: String? = null
+              private var loadToken = 0
+
+              private val controllerCallback = object : MediaController.Callback() {
+                  override fun onMetadataChanged(metadata: MediaMetadata?) = refresh()
+                  override fun onPlaybackStateChanged(state: PlaybackState?) = refresh()
+                  override fun onSessionDestroyed() = refreshSessions()
+              }
+
+              private val sessionsListener =
+                  MediaSessionManager.OnActiveSessionsChangedListener { list -> setControllers(list.orEmpty()) }
+
+              // ---------------------------------------------------------------- public API (main thread)
+
+              fun addListener(listener: Listener) {
+                  listeners.add(listener)
+                  listener.onCover(cover)
+              }
+
+              fun removeListener(listener: Listener) {
+                  listeners.remove(listener)
+              }
+
+              fun addArtistListener(listener: ArtistListener) {
+                  artistListeners.add(listener)
+                  listener.onArtist(artist)
+              }
+
+              fun removeArtistListener(listener: ArtistListener) {
+                  artistListeners.remove(listener)
+              }
+
+              private fun setArtist(value: String?) {
+                  val v = value?.trim()?.takeIf { it.isNotEmpty() }
+                  if (v == artist) return
+                  artist = v
+                  if (v != null) appContext?.let { Prefs.sp(it).edit().putString(LAST_ARTIST_KEY, v).apply() }
+                  artistListeners.forEach { it.onArtist(v) }
+              }
+
+              /** Safe to call as often as you like. Retries if notification access was not granted yet. */
+              fun start(context: Context) {
+                  val app = context.applicationContext
+                  appContext = app
+
+                  if (cover == null && Prefs.load(app).keepLast) loadSavedCover(app)
+                  if (artist == null && Prefs.load(app).keepLast) {
+                      setArtist(Prefs.sp(app).getString(LAST_ARTIST_KEY, null))
+                  }
+
+                  if (!started) {
+                      val manager = app.getSystemService(MediaSessionManager::class.java) ?: return
+                      try {
+                          manager.addOnActiveSessionsChangedListener(
+                              sessionsListener,
+                              listenerComponent(app),
+                              main,
+                          )
+                          started = true
+                      } catch (e: SecurityException) {
+                          return // notification access not granted yet
+                      }
+                  }
+                  refreshSessions()
+              }
+
+              /** Re-reads the current song, e.g. after a setting changed. */
+              fun refresh() {
+                  val app = appContext ?: return
+                  val look = Prefs.load(app)
+
+                  val candidates = controllers.filter {
+                      !look.onlyBlazify || it.packageName.startsWith(BLAZIFY_PREFIX)
+                  }
+                  val pick = candidates.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+                      ?: candidates.firstOrNull()
+
+                  if (pick == null) {
+                      if (!look.keepLast) {
+                          setArtist(null)
+                          if (cover != null) {
+                              currentKey = null
+                              publish(null, save = false)
+                          }
+                      }
+                      return
+                  }
+
+                  val md = pick.metadata ?: return
+                  setArtist(
+                      md.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
+                          ?: md.getString(MediaMetadata.METADATA_KEY_ARTIST),
+                  )
+                  val uriString = md.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+                      ?: md.getString(MediaMetadata.METADATA_KEY_ART_URI)
+                      ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI)
+                  val direct = md.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                      ?: md.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                      ?: md.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+
+                  val key = listOf(
+                      pick.packageName,
+                      md.getString(MediaMetadata.METADATA_KEY_MEDIA_ID),
+                      md.getString(MediaMetadata.METADATA_KEY_TITLE),
+                      md.getString(MediaMetadata.METADATA_KEY_ARTIST),
+                      uriString,
+                      direct?.width,
+                  ).joinToString("|")
+                  if (key == currentKey) return
+                  currentKey = key
+
+                  val token = ++loadToken
+                  io.execute {
+                      val bitmap = runCatching { fetch(app, direct, uriString) }.getOrNull()
+                      main.post {
+                          if (token != loadToken) return@post // a newer song already took over
+                          if (bitmap != null) publish(bitmap, save = true) else currentKey = null // retry later
+                      }
+                  }
+              }
+
+              // ---------------------------------------------------------------- sessions
+
+              private fun listenerComponent(app: Context) =
+                  ComponentName(app, NowPlayingListenerService::class.java)
+
+              private fun refreshSessions() {
+                  val app = appContext ?: return
+                  val manager = app.getSystemService(MediaSessionManager::class.java) ?: return
+                  try {
+                      setControllers(manager.getActiveSessions(listenerComponent(app)))
+                  } catch (e: SecurityException) {
+                      // not allowed (yet)
+                  }
+              }
+
+              private fun setControllers(list: List<MediaController>) {
+                  controllers.forEach { runCatching { it.unregisterCallback(controllerCallback) } }
+                  controllers = list
+                  controllers.forEach { it.registerCallback(controllerCallback, main) }
+                  refresh()
+              }
+
+              private fun publish(bitmap: Bitmap?, save: Boolean) {
+                  cover = bitmap
+                  listeners.forEach { it.onCover(bitmap) }
+                  if (save && bitmap != null) saveCover(bitmap)
+              }
+
+              // ---------------------------------------------------------------- artwork loading (io thread)
+
+              private fun fetch(app: Context, direct: Bitmap?, uriString: String?): Bitmap? {
+                  // A big embedded bitmap is perfect. A small one is only a thumbnail, so try the link first.
+                  if (direct != null && min(direct.width, direct.height) >= 400) return squareAndScale(direct)
+
+                  val loaded = uriString?.let { runCatching { loadUri(app, Uri.parse(it)) }.getOrNull() }
+                  val best = loaded ?: direct ?: return null
+                  return squareAndScale(best)
+              }
+
+              private fun loadUri(app: Context, uri: Uri): Bitmap? {
+                  val bytes = when (uri.scheme) {
+                      "http", "https" -> download(uri.toString())
+                      else -> app.contentResolver.openInputStream(uri)?.use { readLimited(it) }
+                  } ?: return null
+
+                  val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                  var sample = 1
+                  while (min(bounds.outWidth, bounds.outHeight) / (sample * 2) >= MAX_SIDE) sample *= 2
+
+                  val options = BitmapFactory.Options().apply { inSampleSize = sample }
+                  return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+              }
+
+              private fun download(url: String): ByteArray? {
+                  val connection = URL(url).openConnection() as HttpURLConnection
+                  return try {
+                      connection.connectTimeout = 8000
+                      connection.readTimeout = 8000
+                      connection.instanceFollowRedirects = true
+                      if (connection.responseCode != 200) null
+                      else connection.inputStream.use { readLimited(it) }
+                  } finally {
+                      connection.disconnect()
+                  }
+              }
+
+              private fun readLimited(input: InputStream): ByteArray? {
+                  val out = ByteArrayOutputStream()
+                  val buffer = ByteArray(16 * 1024)
+                  while (true) {
+                      val read = input.read(buffer)
+                      if (read < 0) break
+                      out.write(buffer, 0, read)
+                      if (out.size() > MAX_DOWNLOAD_BYTES) return null
+                  }
+                  return out.toByteArray()
+              }
+
+              /** Center-crops to a square (videos thumbnails are 16:9) and caps the size. */
+              private fun squareAndScale(src: Bitmap): Bitmap {
+                  val side = min(src.width, src.height)
+                  val x = (src.width - side) / 2
+                  val y = (src.height - side) / 2
+                  val square = if (side == src.width && side == src.height) src
+                  else Bitmap.createBitmap(src, x, y, side, side)
+                  return if (side > MAX_SIDE) Bitmap.createScaledBitmap(square, MAX_SIDE, MAX_SIDE, true) else square
+              }
+
+              // ---------------------------------------------------------------- remember the last cover
+
+              private fun saveCover(bitmap: Bitmap) {
+                  val app = appContext ?: return
+                  io.execute {
+                      runCatching {
+                          FileOutputStream(File(app.filesDir, SAVED_FILE)).use {
+                              bitmap.compress(Bitmap.CompressFormat.JPEG, 92, it)
+                          }
+                      }
+                  }
+              }
+
+              private fun loadSavedCover(app: Context) {
+                  io.execute {
+                      val saved = runCatching {
+                          val file = File(app.filesDir, SAVED_FILE)
+                          if (file.exists()) BitmapFactory.decodeFile(file.path) else null
+                      }.getOrNull()
+                      if (saved != null) {
+                          main.post { if (cover == null) publish(saved, save = false) }
+                      }
+                  }
+              }
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/coverwallpaper/Prefs.kt')"
+          cat > 'app/src/main/java/com/example/coverwallpaper/Prefs.kt' <<'COVER_EOF'
+          package com.example.coverwallpaper
+
+          import android.content.Context
+          import android.content.SharedPreferences
+
+          /** Everything you can tweak about the look. Change defaults here. */
+          data class Look(
+              /** Only react to Blazify (package starts with com.blazify). Off = any music app. */
+              val onlyBlazify: Boolean = true,
+              /** Draw the cover itself in the middle. Off = only the flipped copies at top and bottom. */
+              val centerShown: Boolean = true,
+              /** Size of the cover as a percentage of the screen width. */
+              val sizePct: Int = 100,
+              /** Moves the whole layout up (negative) or down (positive), as a percentage of screen height. */
+              val offsetPct: Int = 0,
+              /** true = copies are mirrored/flipped, false = copies are plain repeats. */
+              val mirror: Boolean = true,
+              /** Blur on the top/bottom copies, 0 to 100. */
+              val blurPct: Int = 0,
+              /** Black overlay over everything, 0 to 100. */
+              val dimPct: Int = 0,
+              /** Cross-fade time when the song changes, in milliseconds. */
+              val fadeMs: Int = 400,
+              /** Keep showing the last cover when nothing is playing. */
+              val keepLast: Boolean = true,
+              /** Home screen: turn app icons into the artist's album/EP covers. */
+              val iconCovers: Boolean = true,
+              /** Home screen: icons per row. */
+              val columns: Int = 4,
+              /** Home screen: icon corner rounding, 0 = square, 50 = circle. */
+              val corner: Int = 22,
+          )
+
+          object Prefs {
+              const val FILE = "cover_prefs"
+
+              const val ONLY_BLAZIFY = "only_blazify"
+              const val CENTER_SHOWN = "center_shown"
+              const val SIZE_PCT = "size_pct"
+              const val OFFSET_PCT = "offset_pct"
+              const val MIRROR = "mirror"
+              const val BLUR_PCT = "blur_pct"
+              const val DIM_PCT = "dim_pct"
+              const val FADE_MS = "fade_ms"
+              const val KEEP_LAST = "keep_last"
+              const val ICON_COVERS = "icon_covers"
+              const val COLUMNS = "columns"
+              const val CORNER = "corner"
+
+              fun sp(context: Context): SharedPreferences =
+                  context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+
+              fun load(context: Context): Look {
+                  val d = Look()
+                  val p = sp(context)
+                  return Look(
+                      onlyBlazify = p.getBoolean(ONLY_BLAZIFY, d.onlyBlazify),
+                      centerShown = p.getBoolean(CENTER_SHOWN, d.centerShown),
+                      sizePct = p.getInt(SIZE_PCT, d.sizePct),
+                      offsetPct = p.getInt(OFFSET_PCT, d.offsetPct),
+                      mirror = p.getBoolean(MIRROR, d.mirror),
+                      blurPct = p.getInt(BLUR_PCT, d.blurPct),
+                      dimPct = p.getInt(DIM_PCT, d.dimPct),
+                      fadeMs = p.getInt(FADE_MS, d.fadeMs),
+                      keepLast = p.getBoolean(KEEP_LAST, d.keepLast),
+                      iconCovers = p.getBoolean(ICON_COVERS, d.iconCovers),
+                      columns = p.getInt(COLUMNS, d.columns),
+                      corner = p.getInt(CORNER, d.corner),
+                  )
+              }
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/coverwallpaper/SettingsActivity.kt')"
+          cat > 'app/src/main/java/com/example/coverwallpaper/SettingsActivity.kt' <<'COVER_EOF'
+          package com.example.coverwallpaper
+
+          import android.app.Activity
+          import android.app.WallpaperManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+
+          /** Plain-code settings screen: setup buttons at the top, then one control per Look option. */
+          class SettingsActivity : Activity() {
+
+              private lateinit var status: TextView
+              private lateinit var column: LinearLayout
+
+              private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+
+              @Suppress("DEPRECATION")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  column = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(20), dp(20), dp(32))
+                  }
+                  val scroll = ScrollView(this).apply {
+                      addView(column)
+                      setOnApplyWindowInsetsListener { v, insets ->
+                          v.setPadding(
+                              insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
+                              insets.systemWindowInsetRight, insets.systemWindowInsetBottom,
+                          )
+                          insets
+                      }
+                  }
+                  setContentView(scroll)
+
+                  heading("Cover Wallpaper")
+                  body("Shows the cover of the song playing in Blazify as your wallpaper.")
+
+                  status = body("")
+                  button("1. Allow now-playing access") { openAccessSettings() }
+                  button("2. Set as wallpaper") { openWallpaperPicker() }
+
+                  header("Look")
+                  val d = Look()
+                  switchRow(Prefs.CENTER_SHOWN, "Cover in the middle (off = only top and bottom copies)", d.centerShown)
+                  switchRow(Prefs.MIRROR, "Flip the copies (off = plain repeats)", d.mirror)
+                  seekRow(Prefs.SIZE_PCT, "Cover size", 30, 100, d.sizePct, "% of width")
+                  seekRow(Prefs.OFFSET_PCT, "Vertical position", -30, 30, d.offsetPct, "% of height")
+                  seekRow(Prefs.BLUR_PCT, "Blur on the copies", 0, 100, d.blurPct, "%")
+                  seekRow(Prefs.DIM_PCT, "Darken", 0, 90, d.dimPct, "%")
+                  seekRow(Prefs.FADE_MS, "Fade between songs", 0, 2000, d.fadeMs, "ms")
+
+                  header("Home screen (album icons)")
+                  body(
+                      "While a song plays, every app icon on the Cover Home screen turns into one of the " +
+                          "artist's album or EP covers. With fewer covers than apps, they repeat. " +
+                          "Android can't change icons on your normal launcher, so this is its own home screen. " +
+                          "Long-press an app for its info/uninstall page.",
+                  )
+                  button("Use Cover Home as home screen") { openHomeSettings() }
+                  switchRow(Prefs.ICON_COVERS, "Album covers as app icons", d.iconCovers)
+                  seekRow(Prefs.COLUMNS, "Icons per row", 3, 6, d.columns, "")
+                  seekRow(Prefs.CORNER, "Icon corner rounding (50 = circle)", 0, 50, d.corner, "%")
+
+                  header("Behaviour")
+                  switchRow(Prefs.ONLY_BLAZIFY, "Only react to Blazify (off = any music app)", d.onlyBlazify)
+                  switchRow(Prefs.KEEP_LAST, "Keep the last cover when nothing is playing", d.keepLast)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val enabled = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+                      ?.contains(packageName) == true
+                  status.text = if (enabled) {
+                      "Now-playing access: ON"
+                  } else {
+                      "Now-playing access: OFF. Turn it on for \"Cover Wallpaper\" in the next screen. " +
+                          "If the switch is greyed out: Settings > Apps > Cover Wallpaper > ⋮ > Allow restricted settings."
+                  }
+                  if (enabled) NowPlayingTracker.start(this)
+              }
+
+              // ------------------------------------------------------------ actions
+
+              private fun openAccessSettings() {
+                  try {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  } catch (e: Exception) {
+                      startActivity(Intent(Settings.ACTION_SETTINGS))
+                  }
+              }
+
+              private fun openHomeSettings() {
+                  try {
+                      startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
+                  } catch (e: Exception) {
+                      startActivity(Intent(Settings.ACTION_SETTINGS))
+                  }
+              }
+
+              private fun openWallpaperPicker() {
+                  val direct = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).putExtra(
+                      WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,
+                      ComponentName(this, CoverWallpaperService::class.java),
+                  )
+                  try {
+                      startActivity(direct)
+                  } catch (e: Exception) {
+                      startActivity(Intent(WallpaperManager.ACTION_LIVE_WALLPAPER_CHOOSER))
+                  }
+              }
+
+              // ------------------------------------------------------------ view helpers
+
+              private fun heading(text: String) {
+                  column.addView(TextView(this).apply {
+                      this.text = text
+                      textSize = 26f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setPadding(0, 0, 0, dp(8))
+                  })
+              }
+
+              private fun header(text: String) {
+                  column.addView(TextView(this).apply {
+                      this.text = text
+                      textSize = 18f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setPadding(0, dp(24), 0, dp(4))
+                  })
+              }
+
+              private fun body(text: String): TextView {
+                  val view = TextView(this).apply {
+                      this.text = text
+                      textSize = 15f
+                      setPadding(0, dp(4), 0, dp(8))
+                  }
+                  column.addView(view)
+                  return view
+              }
+
+              private fun button(label: String, onClick: () -> Unit) {
+                  column.addView(Button(this).apply {
+                      text = label
+                      setAllCaps(false)
+                      setOnClickListener { onClick() }
+                  })
+              }
+
+              private fun switchRow(key: String, label: String, default: Boolean) {
+                  val prefs = Prefs.sp(this)
+                  column.addView(Switch(this).apply {
+                      text = label
+                      textSize = 15f
+                      isChecked = prefs.getBoolean(key, default)
+                      setPadding(0, dp(10), 0, dp(10))
+                      setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean(key, checked).apply() }
+                  })
+              }
+
+              private fun seekRow(key: String, label: String, min: Int, max: Int, default: Int, unit: String) {
+                  val prefs = Prefs.sp(this)
+                  val current = prefs.getInt(key, default).coerceIn(min, max)
+
+                  val caption = TextView(this).apply {
+                      textSize = 15f
+                      gravity = Gravity.START
+                      setPadding(0, dp(12), 0, 0)
+                  }
+                  fun show(value: Int) {
+                      caption.text = "$label: $value $unit"
+                  }
+                  show(current)
+
+                  val bar = SeekBar(this).apply {
+                      this.max = max - min
+                      progress = current - min
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {
+                              val value = progress + min
+                              show(value)
+                              if (fromUser) prefs.edit().putInt(key, value).apply()
+                          }
+
+                          override fun onStartTrackingTouch(sb: SeekBar) {}
+                          override fun onStopTrackingTouch(sb: SeekBar) {}
+                      })
+                  }
+                  column.addView(caption)
+                  column.addView(bar, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+                  ))
+              }
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'COVER_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Cover Wallpaper</string>
+              <string name="launcher_name">Cover Home</string>
+              <string name="wallpaper_description">Uses the cover of the song playing in Blazify as your wallpaper.</string>
+          </resources>
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/themes.xml')"
+          cat > 'app/src/main/res/values/themes.xml' <<'COVER_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar" />
+
+              <!-- Wallpaper shows through behind the app grid. -->
+              <style name="LauncherTheme" parent="@android:style/Theme.Material.Wallpaper.NoTitleBar">
+                  <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+                  <item name="android:statusBarColor">@android:color/transparent</item>
+                  <item name="android:navigationBarColor">@android:color/transparent</item>
+              </style>
+          </resources>
+          COVER_EOF
+          mkdir -p "$(dirname 'app/src/main/res/xml/wallpaper.xml')"
+          cat > 'app/src/main/res/xml/wallpaper.xml' <<'COVER_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <wallpaper xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/wallpaper_description"
+              android:settingsActivity="com.example.coverwallpaper/.SettingsActivity" />
+          COVER_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'COVER_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          COVER_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'COVER_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          COVER_EOF
+          mkdir -p "$(dirname 'gradle/wrapper/gradle-wrapper.properties')"
+          cat > 'gradle/wrapper/gradle-wrapper.properties' <<'COVER_EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.9-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          COVER_EOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'COVER_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "BlazifyCoverWallpaper"
+          include(":app")
+          COVER_EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk CoverWidgets.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: CoverWidgets.apk
